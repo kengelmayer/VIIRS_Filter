@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VIIRS Vegetation Hotspots</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 48rem; margin: 4rem auto; padding: 0 1.25rem; line-height: 1.5; }
+    dt { margin-top: 1rem; font-weight: 700; }
+    dd { margin-left: 0; }
+    code { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>VIIRS Vegetation Hotspots</h1>
+  <p>Gefilterte VIIRS-Thermal-Hotspots der letzten 24 Stunden.</p>
+  <dl>
+    <dt>Status</dt><dd id="status">GeoJSON wird geprüft …</dd>
+    <dt>Letzte Erzeugung</dt><dd id="generated">–</dd>
+    <dt>Anzahl Hotspots</dt><dd id="count">–</dd>
+    <dt>GeoJSON-Größe</dt><dd id="size">–</dd>
+  </dl>
+  <p><a href="viirs_vegetation_24h.geojson">GeoJSON öffnen oder herunterladen</a></p>
+  <script>
+    fetch("status.json", { cache: "no-store" })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((data) => {
+        document.querySelector("#status").textContent = "Verfügbar";
+        document.querySelector("#generated").textContent = data.generated_at || "–";
+        document.querySelector("#count").textContent = Number(data.feature_count || 0).toLocaleString("de-DE");
+        const mebibytes = Number(data.geojson_size_bytes || 0) / 1024 / 1024;
+        document.querySelector("#size").textContent = `${mebibytes.toFixed(1)} MiB`;
+      })
+      .catch((error) => {
+        document.querySelector("#status").textContent = `Fehler: ${error.message}`;
+      });
+  </script>
+</body>
+</html>
