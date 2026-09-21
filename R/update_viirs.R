@@ -481,19 +481,30 @@ frame_to_feature_collection <- function(detections) {
       ,
       drop = FALSE
     ]
+
+    # Recalculate age for every point on every workflow run.
+    detections$hours_old <- round(
+      (as.numeric(now_utc) * 1000 - detections$acq_time_ms) / 3600000,
+      1
+    )
   }
 
   features <- lapply(seq_len(nrow(detections)), function(i) {
     row <- detections[i, , drop = FALSE]
+
     list(
       type = "Feature",
       id = row$detection_id[[1]],
       geometry = list(
         type = "Point",
-        coordinates = unname(c(row$longitude[[1]], row$latitude[[1]]))
+        coordinates = unname(c(
+          row$longitude[[1]],
+          row$latitude[[1]]
+        ))
       ),
       properties = list(
         acq_time = row$acq_time[[1]],
+        hours_old = row$hours_old[[1]],
         frp = row$frp[[1]],
         landcover_center_class = row$landcover_center_class[[1]],
         country = row$country[[1]]
@@ -503,8 +514,15 @@ frame_to_feature_collection <- function(detections) {
 
   list(
     type = "FeatureCollection",
-    name = sprintf("VIIRS vegetation hotspots - rolling %d hours", rolling_hours),
-    generated_at = format(now_utc, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    name = sprintf(
+      "VIIRS vegetation hotspots - rolling %d hours",
+      rolling_hours
+    ),
+    generated_at = format(
+      now_utc,
+      "%Y-%m-%dT%H:%M:%SZ",
+      tz = "UTC"
+    ),
     features = features
   )
 }
