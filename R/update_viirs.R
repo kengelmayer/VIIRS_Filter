@@ -32,6 +32,7 @@ country_path <- Sys.getenv(
   "COUNTRY_BOUNDARIES_PATH",
   unset = file.path("data", "ne_50m_admin_0_countries.geojson")
 )
+
 rolling_hours <- env_integer("ROLLING_WINDOW_HOURS", 24L, minimum = 1L, maximum = 168L)
 source_overlap <- env_integer("SOURCE_OVERLAP_HOURS", 1L, minimum = 0L, maximum = 12L)
 bootstrap_hours <- env_integer("BOOTSTRAP_HOURS", 0L, minimum = 0L, maximum = 168L)
@@ -46,6 +47,7 @@ vegetation_codes <- strsplit(
   fixed = TRUE
 )[[1]]
 vegetation_codes <- suppressWarnings(as.integer(trimws(vegetation_codes)))
+
 if (anyNA(vegetation_codes)) {
   stop("VEGETATION_CODES must contain comma-separated integers")
 }
@@ -56,6 +58,7 @@ confidence_values <- strsplit(
   fixed = TRUE
 )[[1]]
 confidence_values <- trimws(confidence_values)
+
 if (any(!grepl("^[A-Za-z]+$", confidence_values))) {
   stop("VIIRS_CONFIDENCE contains an invalid value")
 }
@@ -66,11 +69,15 @@ now_utc <- if (nzchar(now_override)) {
 } else {
   as.POSIXct(Sys.time(), tz = "UTC")
 }
+
 if (is.na(now_utc)) {
   stop("NOW_UTC is not a valid timestamp")
 }
 
-message(sprintf("Run time: %s", format(now_utc, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")))
+message(sprintf(
+  "Run time: %s",
+  format(now_utc, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+))
 
 encode_query <- function(params) {
   paste(
@@ -102,16 +109,29 @@ get_json <- function(url, params, attempts = 4L) {
           connecttimeout = 30,
           timeout = 300
         )
+
         curl::curl_fetch_memory(request_url, handle = handle)
       },
       error = function(error) error
     )
 
-    if (!inherits(result, "error") && result$status_code >= 200L && result$status_code < 300L) {
-      parsed <- jsonlite::fromJSON(rawToChar(result$content), simplifyVector = FALSE)
+    if (
+      !inherits(result, "error") &&
+      result$status_code >= 200L &&
+      result$status_code < 300L
+    ) {
+      parsed <- jsonlite::fromJSON(
+        rawToChar(result$content),
+        simplifyVector = FALSE
+      )
+
       if (!is.null(parsed$error)) {
-        stop("ArcGIS REST error: ", parsed$error$message %||% "unknown error")
+        stop(
+          "ArcGIS REST error: ",
+          parsed$error$message %||% "unknown error"
+        )
       }
+
       return(parsed)
     }
 
@@ -120,6 +140,7 @@ get_json <- function(url, params, attempts = 4L) {
     } else {
       paste("HTTP", result$status_code)
     }
+
     if (attempt < attempts) {
       Sys.sleep(min(2^(attempt - 1L), 8))
     }
@@ -130,7 +151,12 @@ get_json <- function(url, params, attempts = 4L) {
 
 feature_property <- function(properties, name, default = NA) {
   value <- properties[[name]]
-  if (is.null(value) || length(value) == 0L) default else value[[1]]
+
+  if (is.null(value) || length(value) == 0L) {
+    default
+  } else {
+    value[[1]]
+  }
 }
 
 empty_detection_frame_with_country <- function() {
@@ -144,8 +170,13 @@ read_existing_geojson <- function(path) {
     return(empty_detection_frame_with_country())
   }
 
-  document <- jsonlite::fromJSON(path, simplifyVector = FALSE)
+  document <- jsonlite::fromJSON(
+    path,
+    simplifyVector = FALSE
+  )
+
   features <- document$features %||% list()
+
   if (length(features) == 0L) {
     return(empty_detection_frame_with_country())
   }
@@ -154,10 +185,15 @@ read_existing_geojson <- function(path) {
     properties <- feature$properties %||% list()
     coordinates <- feature$geometry$coordinates %||% c(NA_real_, NA_real_)
 
-    # The slim public GeoJSON keeps acq_time but no longer stores acq_time_ms.
-    # Read acq_time_ms from old files when available; otherwise reconstruct it.
-    acq_time <- as.character(feature_property(properties, "acq_time", ""))
-    acq_time_ms <- as.numeric(feature_property(properties, "acq_time_ms", NA_real_))
+    # acq_time_ms is no longer published, so reconstruct it from acq_time.
+    # The fallback still supports older GeoJSON files containing acq_time_ms.
+    acq_time <- as.character(
+      feature_property(properties, "acq_time", "")
+    )
+
+    acq_time_ms <- as.numeric(
+      feature_property(properties, "acq_time_ms", NA_real_)
+    )
 
     if (is.na(acq_time_ms) && nzchar(acq_time)) {
       parsed_time <- as.POSIXct(
@@ -165,66 +201,111 @@ read_existing_geojson <- function(path) {
         format = "%Y-%m-%dT%H:%M:%SZ",
         tz = "UTC"
       )
+
       if (!is.na(parsed_time)) {
         acq_time_ms <- as.numeric(parsed_time) * 1000
       }
     }
 
     data.frame(
-      # New files store detection_id only as the GeoJSON feature id.
-      # Fall back to the old property during the migration run.
       detection_id = as.character(
-        feature$id %||% feature_property(properties, "detection_id", "")
+        feature$id %||%
+          feature_property(properties, "detection_id", "")
       ),
       longitude = as.numeric(coordinates[[1]]),
       latitude = as.numeric(coordinates[[2]]),
       acq_time_ms = acq_time_ms,
       acq_time = acq_time,
 
-      # These columns remain part of the internal processing schema.
-      # Older GeoJSON files may still contain them; slim files will not.
-      satellite = as.character(feature_property(properties, "satellite", "")),
-      confidence = as.character(feature_property(properties, "confidence", "")),
-      frp = as.numeric(feature_property(properties, "frp")),
-      daynight = as.character(feature_property(properties, "daynight", "")),
-      scan_km = as.numeric(feature_property(properties, "scan_km", NA_real_)),
-      track_km = as.numeric(feature_property(properties, "track_km", NA_real_)),
+      # Internal fields are retained for processing compatibility.
+      satellite = as.character(
+        feature_property(properties, "satellite", "")
+      ),
+      confidence = as.character(
+        feature_property(properties, "confidence", "")
+      ),
+      frp = as.numeric(
+        feature_property(properties, "frp")
+      ),
+      daynight = as.character(
+        feature_property(properties, "daynight", "")
+      ),
+      scan_km = as.numeric(
+        feature_property(properties, "scan_km", NA_real_)
+      ),
+      track_km = as.numeric(
+        feature_property(properties, "track_km", NA_real_)
+      ),
       source_hours_old_at_ingest = as.integer(
-        feature_property(properties, "source_hours_old_at_ingest", NA_integer_)
+        feature_property(
+          properties,
+          "source_hours_old_at_ingest",
+          NA_integer_
+        )
       ),
       landcover_center_code = as.integer(
-        feature_property(properties, "landcover_center_code", NA_integer_)
+        feature_property(
+          properties,
+          "landcover_center_code",
+          NA_integer_
+        )
       ),
       landcover_center_class = as.character(
-        feature_property(properties, "landcover_center_class", "Unknown")
+        feature_property(
+          properties,
+          "landcover_center_class",
+          "Unknown"
+        )
       ),
+
+      # Existing points keep their already stored country.
+      # Points created before the country field was introduced stay blank.
       country = as.character(
-        feature_property(properties, "country", "")
+        feature_property(
+          properties,
+          "country",
+          ""
+        )
       ),
       vegetation_share = as.numeric(
-        feature_property(properties, "vegetation_share", NA_real_)
+        feature_property(
+          properties,
+          "vegetation_share",
+          NA_real_
+        )
       ),
       landcover_samples = as.integer(
-        feature_property(properties, "landcover_samples", NA_integer_)
+        feature_property(
+          properties,
+          "landcover_samples",
+          NA_integer_
+        )
       ),
       stringsAsFactors = FALSE
     )
   })
 
   result <- do.call(rbind, rows)
-  valid <- nzchar(result$detection_id) & !is.na(result$acq_time_ms)
+
+  valid <-
+    nzchar(result$detection_id) &
+    !is.na(result$acq_time_ms)
+
   result[valid, , drop = FALSE]
 }
 
 get_minimum_source_age <- function() {
   statistics <- jsonlite::toJSON(
-    list(list(
-      statisticType = "min",
-      onStatisticField = "hours_old",
-      outStatisticFieldName = "min_age"
-    )),
+    list(
+      list(
+        statisticType = "min",
+        onStatisticField = "hours_old",
+        outStatisticFieldName = "min_age"
+      )
+    ),
     auto_unbox = TRUE
   )
+
   response <- get_json(
     VIIRS_QUERY_URL,
     list(
@@ -234,61 +315,129 @@ get_minimum_source_age <- function() {
       f = "json"
     )
   )
-  value <- response$features[[1]]$attributes$min_age %||% NULL
-  if (is.null(value)) stop("The VIIRS service did not return a minimum hours_old value")
+
+  value <-
+    response$features[[1]]$attributes$min_age %||%
+    NULL
+
+  if (is.null(value)) {
+    stop(
+      "The VIIRS service did not return a minimum hours_old value"
+    )
+  }
+
   as.integer(value)
 }
 
 arcgis_features_to_frame <- function(features) {
-  if (length(features) == 0L) return(empty_detection_frame()[, 1:12, drop = FALSE])
+  if (length(features) == 0L) {
+    return(
+      empty_detection_frame()[, 1:12, drop = FALSE]
+    )
+  }
 
   rows <- lapply(features, function(feature) {
     attributes <- feature$attributes %||% list()
     geometry <- feature$geometry %||% list()
-    longitude <- as.numeric(geometry$x %||% attributes$longitude %||% NA_real_)
-    latitude <- as.numeric(geometry$y %||% attributes$latitude %||% NA_real_)
-    acq_time_ms <- as.numeric(attributes$acq_time %||% NA_real_)
-    satellite <- as.character(attributes$satellite %||% "")
+
+    longitude <- as.numeric(
+      geometry$x %||%
+        attributes$longitude %||%
+        NA_real_
+    )
+
+    latitude <- as.numeric(
+      geometry$y %||%
+        attributes$latitude %||%
+        NA_real_
+    )
+
+    acq_time_ms <- as.numeric(
+      attributes$acq_time %||% NA_real_
+    )
+
+    satellite <- as.character(
+      attributes$satellite %||% ""
+    )
 
     data.frame(
-      detection_id = make_detection_id(satellite, acq_time_ms, longitude, latitude),
+      detection_id = make_detection_id(
+        satellite,
+        acq_time_ms,
+        longitude,
+        latitude
+      ),
       longitude = longitude,
       latitude = latitude,
       acq_time_ms = acq_time_ms,
       acq_time = epoch_ms_to_iso(acq_time_ms),
       satellite = satellite,
-      confidence = as.character(attributes$confidence %||% ""),
-      frp = as.numeric(attributes$frp %||% NA_real_),
-      daynight = as.character(attributes$daynight %||% ""),
-      scan_km = as.numeric(attributes$scan %||% NA_real_),
-      track_km = as.numeric(attributes$track %||% NA_real_),
-      source_hours_old_at_ingest = as.integer(attributes$hours_old %||% NA_integer_),
+      confidence = as.character(
+        attributes$confidence %||% ""
+      ),
+      frp = as.numeric(
+        attributes$frp %||% NA_real_
+      ),
+      daynight = as.character(
+        attributes$daynight %||% ""
+      ),
+      scan_km = as.numeric(
+        attributes$scan %||% NA_real_
+      ),
+      track_km = as.numeric(
+        attributes$track %||% NA_real_
+      ),
+      source_hours_old_at_ingest = as.integer(
+        attributes$hours_old %||% NA_integer_
+      ),
       stringsAsFactors = FALSE
     )
   })
 
   result <- do.call(rbind, rows)
-  valid <- is.finite(result$longitude) & is.finite(result$latitude) & !is.na(result$acq_time_ms)
+
+  valid <-
+    is.finite(result$longitude) &
+    is.finite(result$latitude) &
+    !is.na(result$acq_time_ms)
+
   result[valid, , drop = FALSE]
 }
 
 query_viirs <- function(maximum_source_age) {
-  confidence_sql <- paste(sprintf("'%s'", confidence_values), collapse = ",")
+  confidence_sql <- paste(
+    sprintf("'%s'", confidence_values),
+    collapse = ","
+  )
+
   where <- sprintf(
     "hours_old <= %d AND confidence IN (%s)",
     maximum_source_age,
     confidence_sql
   )
+
+  # These fields are still required internally even though most are
+  # not written to the public GeoJSON.
   fields <- paste(
     c(
-      "OBJECTID", "latitude", "longitude", "acq_time", "satellite",
-      "confidence", "frp", "daynight", "scan", "track", "hours_old"
+      "OBJECTID",
+      "latitude",
+      "longitude",
+      "acq_time",
+      "satellite",
+      "confidence",
+      "frp",
+      "daynight",
+      "scan",
+      "track",
+      "hours_old"
     ),
     collapse = ","
   )
 
   offset <- 0L
   all_features <- list()
+
   repeat {
     response <- get_json(
       VIIRS_QUERY_URL,
@@ -303,11 +452,22 @@ query_viirs <- function(maximum_source_age) {
         f = "json"
       )
     )
+
     page <- response$features %||% list()
     all_features <- c(all_features, page)
-    message(sprintf("Downloaded %d VIIRS records", length(all_features)))
 
-    if (length(page) == 0L || !isTRUE(response$exceededTransferLimit)) break
+    message(sprintf(
+      "Downloaded %d VIIRS records",
+      length(all_features)
+    ))
+
+    if (
+      length(page) == 0L ||
+      !isTRUE(response$exceededTransferLimit)
+    ) {
+      break
+    }
+
     offset <- offset + length(page)
   }
 
@@ -322,10 +482,26 @@ probe_cog <- function(url) {
     connecttimeout = 30,
     timeout = 120
   )
-  response <- curl::curl_fetch_memory(url, handle = handle)
-  if (response$status_code == 200L) return(TRUE)
-  if (response$status_code == 404L) return(FALSE)
-  stop("Unexpected WorldCover response for ", url, ": HTTP ", response$status_code)
+
+  response <- curl::curl_fetch_memory(
+    url,
+    handle = handle
+  )
+
+  if (response$status_code == 200L) {
+    return(TRUE)
+  }
+
+  if (response$status_code == 404L) {
+    return(FALSE)
+  }
+
+  stop(
+    "Unexpected WorldCover response for ",
+    url,
+    ": HTTP ",
+    response$status_code
+  )
 }
 
 sample_worldcover <- function(detections) {
@@ -334,6 +510,7 @@ sample_worldcover <- function(detections) {
     detections$landcover_center_class <- character()
     detections$vegetation_share <- numeric()
     detections$landcover_samples <- integer()
+
     return(detections)
   }
 
@@ -348,9 +525,18 @@ sample_worldcover <- function(detections) {
     VSI_CACHE_SIZE = "67108864"
   )
 
-  samples <- make_footprint_samples(detections, grid_size = grid_size)
-  tile_groups <- split(seq_len(nrow(samples)), samples$tile_id)
+  samples <- make_footprint_samples(
+    detections,
+    grid_size = grid_size
+  )
+
+  tile_groups <- split(
+    seq_len(nrow(samples)),
+    samples$tile_id
+  )
+
   tile_names <- names(tile_groups)
+
   message(sprintf(
     "Sampling %d footprint positions from %d WorldCover tiles",
     nrow(samples),
@@ -364,44 +550,115 @@ sample_worldcover <- function(detections) {
 
     if (probe_cog(tile_url)) {
       raster <- tryCatch(
-        terra::rast(paste0("/vsicurl/", tile_url)),
+        terra::rast(
+          paste0("/vsicurl/", tile_url)
+        ),
         error = function(error) {
-          stop("Could not open WorldCover tile ", tile_id, ": ", conditionMessage(error))
+          stop(
+            "Could not open WorldCover tile ",
+            tile_id,
+            ": ",
+            conditionMessage(error)
+          )
         }
       )
-      coordinates <- as.matrix(samples[indices, c("longitude", "latitude")])
+
+      coordinates <- as.matrix(
+        samples[
+          indices,
+          c("longitude", "latitude")
+        ]
+      )
+
       extracted <- tryCatch(
-        terra::extract(raster, coordinates),
+        terra::extract(
+          raster,
+          coordinates
+        ),
         error = function(error) {
-          stop("Could not sample WorldCover tile ", tile_id, ": ", conditionMessage(error))
+          stop(
+            "Could not sample WorldCover tile ",
+            tile_id,
+            ": ",
+            conditionMessage(error)
+          )
         }
       )
-      samples$landcover_code[indices] <- as.integer(extracted[[1]])
+
+      samples$landcover_code[indices] <- as.integer(
+        extracted[[1]]
+      )
     }
 
-    if (tile_number %% 25L == 0L || tile_number == length(tile_groups)) {
-      message(sprintf("Processed WorldCover tile %d/%d", tile_number, length(tile_groups)))
+    if (
+      tile_number %% 25L == 0L ||
+      tile_number == length(tile_groups)
+    ) {
+      message(sprintf(
+        "Processed WorldCover tile %d/%d",
+        tile_number,
+        length(tile_groups)
+      ))
     }
   }
 
-  center_code <- rep(NA_integer_, nrow(detections))
+  center_code <- rep(
+    NA_integer_,
+    nrow(detections)
+  )
+
   center_rows <- samples$is_center
-  center_code[samples$detection_row[center_rows]] <- samples$landcover_code[center_rows]
+
+  center_code[
+    samples$detection_row[center_rows]
+  ] <- samples$landcover_code[center_rows]
 
   valid <- !is.na(samples$landcover_code)
-  vegetation <- valid & samples$landcover_code %in% vegetation_codes
-  valid_samples <- tabulate(samples$detection_row[valid], nbins = nrow(detections))
-  vegetation_samples <- tabulate(samples$detection_row[vegetation], nbins = nrow(detections))
-  vegetation_share <- ifelse(valid_samples > 0L, vegetation_samples / valid_samples, NA_real_)
+
+  vegetation <-
+    valid &
+    samples$landcover_code %in%
+      vegetation_codes
+
+  valid_samples <- tabulate(
+    samples$detection_row[valid],
+    nbins = nrow(detections)
+  )
+
+  vegetation_samples <- tabulate(
+    samples$detection_row[vegetation],
+    nbins = nrow(detections)
+  )
+
+  vegetation_share <- ifelse(
+    valid_samples > 0L,
+    vegetation_samples / valid_samples,
+    NA_real_
+  )
 
   detections$landcover_center_code <- center_code
-  detections$landcover_center_class <- worldcover_class_name(center_code)
-  detections$vegetation_share <- round(vegetation_share, 3)
+
+  detections$landcover_center_class <-
+    worldcover_class_name(center_code)
+
+  detections$vegetation_share <- round(
+    vegetation_share,
+    3
+  )
+
   detections$landcover_samples <- valid_samples
 
-  keep <- valid_samples > 0L & vegetation_share >= vegetation_threshold
+  keep <-
+    valid_samples > 0L &
+    vegetation_share >= vegetation_threshold
+
   if (reject_built_center) {
-    keep <- keep & (is.na(center_code) | center_code != 50L)
+    keep <-
+      keep &
+      (
+        is.na(center_code) |
+        center_code != 50L
+      )
   }
 
   message(sprintf(
@@ -409,28 +666,31 @@ sample_worldcover <- function(detections) {
     sum(keep, na.rm = TRUE),
     nrow(detections)
   ))
+
   detections[keep, , drop = FALSE]
 }
 
-
 add_country <- function(detections) {
-  # Only new detections are passed here. Existing rolling points are never
-  # spatially re-checked; old points without a country remain blank until they
-  # age out of the rolling window.
+  # Only newly retained detections enter this function.
+  # Existing rolling points are deliberately not spatially reprocessed.
   if (nrow(detections) == 0L) {
     detections$country <- character()
     return(detections)
   }
 
   if (!file.exists(country_path)) {
-    stop("Country boundary file not found: ", country_path)
+    stop(
+      "Country boundary file not found: ",
+      country_path
+    )
   }
 
   countries <- terra::vect(country_path)
 
-  if (!"NAME_DE" %in% names(countries)) {
+  # Use Natural Earth's sovereign-state name exactly as stored in SOVEREIGNT.
+  if (!"SOVEREIGNT" %in% names(countries)) {
     stop(
-      "Country boundary file must contain a NAME_DE field. Available fields: ",
+      "Country boundary file must contain a SOVEREIGNT field. Available fields: ",
       paste(names(countries), collapse = ", ")
     )
   }
@@ -446,21 +706,37 @@ add_country <- function(detections) {
   )
 
   if (!terra::same.crs(points, countries)) {
-    points <- terra::project(points, terra::crs(countries))
+    points <- terra::project(
+      points,
+      terra::crs(countries)
+    )
   }
 
-  # Point-in-polygon join. detection_row preserves input order.
+  # Point-in-polygon intersection with only the required country attribute.
   matches <- terra::intersect(
     points,
-    countries[, "NAME_DE"]
+    countries[, "SOVEREIGNT"]
   )
 
-  country <- rep("", nrow(detections))
+  country <- rep(
+    "",
+    nrow(detections)
+  )
 
   if (nrow(matches) > 0L) {
-    matched_rows <- as.integer(matches$detection_row)
-    valid <- !duplicated(matched_rows) & !is.na(matched_rows)
-    country[matched_rows[valid]] <- as.character(matches$NAME_DE[valid])
+    matched_rows <- as.integer(
+      matches$detection_row
+    )
+
+    valid <-
+      !duplicated(matched_rows) &
+      !is.na(matched_rows)
+
+    country[
+      matched_rows[valid]
+    ] <- as.character(
+      matches$SOVEREIGNT[valid]
+    )
   }
 
   detections$country <- country
@@ -477,61 +753,95 @@ add_country <- function(detections) {
 frame_to_feature_collection <- function(detections) {
   if (nrow(detections) > 0L) {
     detections <- detections[
-      order(detections$acq_time_ms, detections$detection_id),
+      order(
+        detections$acq_time_ms,
+        detections$detection_id
+      ),
       ,
       drop = FALSE
     ]
 
-    # Recalculate age for every point on every workflow run.
+    # Recalculate age for every point every time the dataset is published.
+    # This keeps Dashboard filters based on hours_old approximately current.
     detections$hours_old <- round(
-      (as.numeric(now_utc) * 1000 - detections$acq_time_ms) / 3600000,
+      (
+        as.numeric(now_utc) * 1000 -
+        detections$acq_time_ms
+      ) / 3600000,
       1
     )
   }
 
-  features <- lapply(seq_len(nrow(detections)), function(i) {
-    row <- detections[i, , drop = FALSE]
+  features <- lapply(
+    seq_len(nrow(detections)),
+    function(i) {
+      row <- detections[i, , drop = FALSE]
 
-    list(
-      type = "Feature",
-      id = row$detection_id[[1]],
-      geometry = list(
-        type = "Point",
-        coordinates = unname(c(
-          row$longitude[[1]],
-          row$latitude[[1]]
-        ))
-      ),
-      properties = list(
-        acq_time = row$acq_time[[1]],
-        hours_old = row$hours_old[[1]],
-        frp = row$frp[[1]],
-        landcover_center_class = row$landcover_center_class[[1]],
-        country = row$country[[1]]
+      list(
+        type = "Feature",
+        id = row$detection_id[[1]],
+
+        geometry = list(
+          type = "Point",
+          coordinates = unname(
+            c(
+              row$longitude[[1]],
+              row$latitude[[1]]
+            )
+          )
+        ),
+
+        # Only fields required by the public ArcGIS layer are written.
+        properties = list(
+          acq_time = row$acq_time[[1]],
+          hours_old = row$hours_old[[1]],
+          frp = row$frp[[1]],
+          landcover_center_class =
+            row$landcover_center_class[[1]],
+          country = row$country[[1]]
+        )
       )
-    )
-  })
+    }
+  )
 
   list(
     type = "FeatureCollection",
+
     name = sprintf(
       "VIIRS vegetation hotspots - rolling %d hours",
       rolling_hours
     ),
+
     generated_at = format(
       now_utc,
       "%Y-%m-%dT%H:%M:%SZ",
       tz = "UTC"
     ),
+
     features = features
   )
 }
 
 write_json_atomic <- function(document, path) {
   directory <- dirname(path)
-  dir.create(directory, recursive = TRUE, showWarnings = FALSE)
-  temporary_path <- tempfile(pattern = "viirs-", tmpdir = directory, fileext = ".geojson")
-  on.exit(unlink(temporary_path), add = TRUE)
+
+  dir.create(
+    directory,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  temporary_path <- tempfile(
+    pattern = "viirs-",
+    tmpdir = directory,
+    fileext = ".geojson"
+  )
+
+  on.exit(
+    unlink(temporary_path),
+    add = TRUE
+  )
+
   jsonlite::write_json(
     document,
     temporary_path,
@@ -541,59 +851,167 @@ write_json_atomic <- function(document, path) {
     na = "null",
     null = "null"
   )
+
   if (!file.rename(temporary_path, path)) {
-    if (!file.copy(temporary_path, path, overwrite = TRUE)) {
-      stop("Could not replace output file: ", path)
+    if (
+      !file.copy(
+        temporary_path,
+        path,
+        overwrite = TRUE
+      )
+    ) {
+      stop(
+        "Could not replace output file: ",
+        path
+      )
     }
   }
 }
 
-existing <- read_existing_geojson(output_path)
-existing <- prune_to_rolling_window(existing, now_utc, rolling_hours)
-message(sprintf("Existing detections within rolling window: %d", nrow(existing)))
+# Restore and prune the previously published rolling dataset.
+existing <- read_existing_geojson(
+  output_path
+)
+
+existing <- prune_to_rolling_window(
+  existing,
+  now_utc,
+  rolling_hours
+)
+
+message(sprintf(
+  "Existing detections within rolling window: %d",
+  nrow(existing)
+))
 
 minimum_source_age <- get_minimum_source_age()
-maximum_source_age <- minimum_source_age + source_overlap
-if (nrow(existing) == 0L && bootstrap_hours > 0L) {
-  maximum_source_age <- max(maximum_source_age, bootstrap_hours)
-  message(sprintf("Empty output: optional bootstrap through source age %d", maximum_source_age))
+
+maximum_source_age <-
+  minimum_source_age +
+  source_overlap
+
+if (
+  nrow(existing) == 0L &&
+  bootstrap_hours > 0L
+) {
+  maximum_source_age <- max(
+    maximum_source_age,
+    bootstrap_hours
+  )
+
+  message(sprintf(
+    "Empty output: optional bootstrap through source age %d",
+    maximum_source_age
+  ))
 }
+
 message(sprintf(
   "Newest source age is %d; querying hours_old <= %d",
   minimum_source_age,
   maximum_source_age
 ))
 
-new_detections <- query_viirs(maximum_source_age)
-new_detections <- prune_to_rolling_window(new_detections, now_utc, rolling_hours)
+# Download only source records needed for this incremental update.
+new_detections <- query_viirs(
+  maximum_source_age
+)
+
+new_detections <- prune_to_rolling_window(
+  new_detections,
+  now_utc,
+  rolling_hours
+)
+
+# Remove duplicates and detections that are already in the rolling dataset.
 new_detections <- new_detections[
-  !duplicated(new_detections$detection_id) & !new_detections$detection_id %in% existing$detection_id,
+  !duplicated(
+    new_detections$detection_id
+  ) &
+    !new_detections$detection_id %in%
+      existing$detection_id,
   ,
   drop = FALSE
 ]
-message(sprintf("Previously unseen detections in rolling window: %d", nrow(new_detections)))
 
-new_candidate_count <- nrow(new_detections)
-new_detections <- sample_worldcover(new_detections)
-new_detections <- add_country(new_detections)
-new_retained_count <- nrow(new_detections)
-combined <- rbind(existing, new_detections)
-combined <- combined[!duplicated(combined$detection_id, fromLast = TRUE), , drop = FALSE]
-combined <- prune_to_rolling_window(combined, now_utc, rolling_hours)
+message(sprintf(
+  "Previously unseen detections in rolling window: %d",
+  nrow(new_detections)
+))
 
-write_json_atomic(frame_to_feature_collection(combined), output_path)
-output_bytes <- file.info(output_path)$size
+new_candidate_count <- nrow(
+  new_detections
+)
+
+# Expensive processing is performed only for genuinely new detections.
+new_detections <- sample_worldcover(
+  new_detections
+)
+
+# Country assignment is performed only after the vegetation filter,
+# avoiding unnecessary point-in-polygon checks.
+new_detections <- add_country(
+  new_detections
+)
+
+new_retained_count <- nrow(
+  new_detections
+)
+
+# Combine old and newly processed detections.
+combined <- rbind(
+  existing,
+  new_detections
+)
+
+combined <- combined[
+  !duplicated(
+    combined$detection_id,
+    fromLast = TRUE
+  ),
+  ,
+  drop = FALSE
+]
+
+combined <- prune_to_rolling_window(
+  combined,
+  now_utc,
+  rolling_hours
+)
+
+# Rewrite the complete public GeoJSON using the slim schema.
+write_json_atomic(
+  frame_to_feature_collection(combined),
+  output_path
+)
+
+output_bytes <- file.info(
+  output_path
+)$size
+
+# Write lightweight status information for the status page.
 write_json_atomic(
   list(
-    generated_at = format(now_utc, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    generated_at = format(
+      now_utc,
+      "%Y-%m-%dT%H:%M:%SZ",
+      tz = "UTC"
+    ),
     feature_count = nrow(combined),
     rolling_window_hours = rolling_hours,
-    geojson_size_bytes = unname(output_bytes),
+    geojson_size_bytes = unname(
+      output_bytes
+    ),
     source_minimum_age = minimum_source_age,
-    source_maximum_age_queried = maximum_source_age,
+    source_maximum_age_queried =
+      maximum_source_age,
     new_candidates = new_candidate_count,
     new_retained = new_retained_count
   ),
   status_path
 )
-message(sprintf("Wrote %d detections to %s", nrow(combined), output_path))
+
+message(sprintf(
+  "Wrote %d detections to %s",
+  nrow(combined),
+  output_path
+))
