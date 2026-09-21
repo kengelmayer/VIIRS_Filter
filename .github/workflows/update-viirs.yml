@@ -81,7 +81,7 @@ jobs:
       - name: Update rolling GeoJSON
         env:
           VIIRS_OUTPUT_PATH: site/viirs_vegetation_24h.geojson
-          ROLLING_WINDOW_HOURS: "24"
+          ROLLING_WINDOW_HOURS: "48"
           SOURCE_OVERLAP_HOURS: "1"
           BOOTSTRAP_HOURS: "0"
           LANDCOVER_GRID_SIZE: "3"
