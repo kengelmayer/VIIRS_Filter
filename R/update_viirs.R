@@ -28,6 +28,10 @@ status_path <- Sys.getenv(
   "VIIRS_STATUS_PATH",
   unset = file.path(dirname(output_path), "status.json")
 )
+country_path <- Sys.getenv(
+  "COUNTRY_BOUNDARIES_PATH",
+  unset = file.path("data", "ne_50m_admin_0_countries.geojson")
+)
 rolling_hours <- env_integer("ROLLING_WINDOW_HOURS", 24L, minimum = 1L, maximum = 168L)
 source_overlap <- env_integer("SOURCE_OVERLAP_HOURS", 1L, minimum = 0L, maximum = 12L)
 bootstrap_hours <- env_integer("BOOTSTRAP_HOURS", 0L, minimum = 0L, maximum = 168L)
@@ -129,37 +133,80 @@ feature_property <- function(properties, name, default = NA) {
   if (is.null(value) || length(value) == 0L) default else value[[1]]
 }
 
+empty_detection_frame_with_country <- function() {
+  detections <- empty_detection_frame()
+  detections$country <- character()
+  detections
+}
+
 read_existing_geojson <- function(path) {
   if (!file.exists(path) || file.info(path)$size == 0) {
-    return(empty_detection_frame())
+    return(empty_detection_frame_with_country())
   }
 
   document <- jsonlite::fromJSON(path, simplifyVector = FALSE)
   features <- document$features %||% list()
   if (length(features) == 0L) {
-    return(empty_detection_frame())
+    return(empty_detection_frame_with_country())
   }
 
   rows <- lapply(features, function(feature) {
     properties <- feature$properties %||% list()
     coordinates <- feature$geometry$coordinates %||% c(NA_real_, NA_real_)
+
+    # The slim public GeoJSON keeps acq_time but no longer stores acq_time_ms.
+    # Read acq_time_ms from old files when available; otherwise reconstruct it.
+    acq_time <- as.character(feature_property(properties, "acq_time", ""))
+    acq_time_ms <- as.numeric(feature_property(properties, "acq_time_ms", NA_real_))
+
+    if (is.na(acq_time_ms) && nzchar(acq_time)) {
+      parsed_time <- as.POSIXct(
+        acq_time,
+        format = "%Y-%m-%dT%H:%M:%SZ",
+        tz = "UTC"
+      )
+      if (!is.na(parsed_time)) {
+        acq_time_ms <- as.numeric(parsed_time) * 1000
+      }
+    }
+
     data.frame(
-      detection_id = as.character(feature_property(properties, "detection_id", feature$id %||% "")),
+      # New files store detection_id only as the GeoJSON feature id.
+      # Fall back to the old property during the migration run.
+      detection_id = as.character(
+        feature$id %||% feature_property(properties, "detection_id", "")
+      ),
       longitude = as.numeric(coordinates[[1]]),
       latitude = as.numeric(coordinates[[2]]),
-      acq_time_ms = as.numeric(feature_property(properties, "acq_time_ms")),
-      acq_time = as.character(feature_property(properties, "acq_time", "")),
+      acq_time_ms = acq_time_ms,
+      acq_time = acq_time,
+
+      # These columns remain part of the internal processing schema.
+      # Older GeoJSON files may still contain them; slim files will not.
       satellite = as.character(feature_property(properties, "satellite", "")),
       confidence = as.character(feature_property(properties, "confidence", "")),
       frp = as.numeric(feature_property(properties, "frp")),
       daynight = as.character(feature_property(properties, "daynight", "")),
-      scan_km = as.numeric(feature_property(properties, "scan_km")),
-      track_km = as.numeric(feature_property(properties, "track_km")),
-      source_hours_old_at_ingest = as.integer(feature_property(properties, "source_hours_old_at_ingest")),
-      landcover_center_code = as.integer(feature_property(properties, "landcover_center_code")),
-      landcover_center_class = as.character(feature_property(properties, "landcover_center_class", "Unknown")),
-      vegetation_share = as.numeric(feature_property(properties, "vegetation_share")),
-      landcover_samples = as.integer(feature_property(properties, "landcover_samples")),
+      scan_km = as.numeric(feature_property(properties, "scan_km", NA_real_)),
+      track_km = as.numeric(feature_property(properties, "track_km", NA_real_)),
+      source_hours_old_at_ingest = as.integer(
+        feature_property(properties, "source_hours_old_at_ingest", NA_integer_)
+      ),
+      landcover_center_code = as.integer(
+        feature_property(properties, "landcover_center_code", NA_integer_)
+      ),
+      landcover_center_class = as.character(
+        feature_property(properties, "landcover_center_class", "Unknown")
+      ),
+      country = as.character(
+        feature_property(properties, "country", "")
+      ),
+      vegetation_share = as.numeric(
+        feature_property(properties, "vegetation_share", NA_real_)
+      ),
+      landcover_samples = as.integer(
+        feature_property(properties, "landcover_samples", NA_integer_)
+      ),
       stringsAsFactors = FALSE
     )
   })
@@ -365,9 +412,75 @@ sample_worldcover <- function(detections) {
   detections[keep, , drop = FALSE]
 }
 
+
+add_country <- function(detections) {
+  # Only new detections are passed here. Existing rolling points are never
+  # spatially re-checked; old points without a country remain blank until they
+  # age out of the rolling window.
+  if (nrow(detections) == 0L) {
+    detections$country <- character()
+    return(detections)
+  }
+
+  if (!file.exists(country_path)) {
+    stop("Country boundary file not found: ", country_path)
+  }
+
+  countries <- terra::vect(country_path)
+
+  if (!"NAME_DE" %in% names(countries)) {
+    stop(
+      "Country boundary file must contain a NAME_DE field. Available fields: ",
+      paste(names(countries), collapse = ", ")
+    )
+  }
+
+  points <- terra::vect(
+    data.frame(
+      detection_row = seq_len(nrow(detections)),
+      longitude = detections$longitude,
+      latitude = detections$latitude
+    ),
+    geom = c("longitude", "latitude"),
+    crs = "EPSG:4326"
+  )
+
+  if (!terra::same.crs(points, countries)) {
+    points <- terra::project(points, terra::crs(countries))
+  }
+
+  # Point-in-polygon join. detection_row preserves input order.
+  matches <- terra::intersect(
+    points,
+    countries[, "NAME_DE"]
+  )
+
+  country <- rep("", nrow(detections))
+
+  if (nrow(matches) > 0L) {
+    matched_rows <- as.integer(matches$detection_row)
+    valid <- !duplicated(matched_rows) & !is.na(matched_rows)
+    country[matched_rows[valid]] <- as.character(matches$NAME_DE[valid])
+  }
+
+  detections$country <- country
+
+  message(sprintf(
+    "Assigned countries to %d/%d new detections",
+    sum(nzchar(country)),
+    nrow(detections)
+  ))
+
+  detections
+}
+
 frame_to_feature_collection <- function(detections) {
   if (nrow(detections) > 0L) {
-    detections <- detections[order(detections$acq_time_ms, detections$detection_id), , drop = FALSE]
+    detections <- detections[
+      order(detections$acq_time_ms, detections$detection_id),
+      ,
+      drop = FALSE
+    ]
   }
 
   features <- lapply(seq_len(nrow(detections)), function(i) {
@@ -380,20 +493,10 @@ frame_to_feature_collection <- function(detections) {
         coordinates = unname(c(row$longitude[[1]], row$latitude[[1]]))
       ),
       properties = list(
-        detection_id = row$detection_id[[1]],
         acq_time = row$acq_time[[1]],
-        acq_time_ms = row$acq_time_ms[[1]],
-        satellite = row$satellite[[1]],
-        confidence = row$confidence[[1]],
         frp = row$frp[[1]],
-        daynight = row$daynight[[1]],
-        scan_km = row$scan_km[[1]],
-        track_km = row$track_km[[1]],
-        source_hours_old_at_ingest = row$source_hours_old_at_ingest[[1]],
-        landcover_center_code = row$landcover_center_code[[1]],
         landcover_center_class = row$landcover_center_class[[1]],
-        vegetation_share = row$vegetation_share[[1]],
-        landcover_samples = row$landcover_samples[[1]]
+        country = row$country[[1]]
       )
     )
   })
@@ -454,6 +557,7 @@ message(sprintf("Previously unseen detections in rolling window: %d", nrow(new_d
 
 new_candidate_count <- nrow(new_detections)
 new_detections <- sample_worldcover(new_detections)
+new_detections <- add_country(new_detections)
 new_retained_count <- nrow(new_detections)
 combined <- rbind(existing, new_detections)
 combined <- combined[!duplicated(combined$detection_id, fromLast = TRUE), , drop = FALSE]
