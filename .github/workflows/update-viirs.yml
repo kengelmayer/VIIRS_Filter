@@ -1,8 +1,6 @@
 name: Update and publish filtered VIIRS hotspots
 
 on:
-  schedule:
-    - cron: "25 * * * *"
   workflow_dispatch:
 
 permissions:
